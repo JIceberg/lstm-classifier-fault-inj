@@ -16,7 +16,7 @@ class FaultyLSTM(nn.Module):
         
         self.cells = nn.ModuleList([nn.LSTMCell(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)])
 
-        self.error_rate = 0.000001
+        self.error_rate = 0.0000001
         self.k = 3
         self.mean_grad = {}
         self.var_grad = {}

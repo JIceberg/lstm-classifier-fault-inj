@@ -113,6 +113,6 @@ def evaluate_model(model, test_loader, num_batches=400, compute_grad=False):
 '''
 Compute statistics
 '''
-# evaluate_model(model, test_loader, compute_grad=True)
+evaluate_model(model, train_loader, compute_grad=True)
 
 evaluate_model(model, test_loader)
