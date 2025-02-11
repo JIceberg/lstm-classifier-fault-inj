@@ -8,6 +8,7 @@ from tqdm import tqdm
 from time import sleep
 import os
 from lstm import FaultyLSTM
+from sklearn.model_selection import train_test_split
 import numpy as np
 
 np.random.seed(42)
@@ -18,8 +19,13 @@ batch_size = 64
 
 (X_train, y_train), (X_test, y_test) = imdb.load_data(num_words=top_words)
 
-X_train = pad_sequences(X_train, maxlen=max_len)
-X_test = pad_sequences(X_test, maxlen=max_len)
+X_train = pad_sequences(X_train, maxlen=max_len, value=0.0)
+X_test = pad_sequences(X_test, maxlen=max_len, value=0.0)
+
+X = np.concatenate((X_train, X_test), axis=0)
+y = np.concatenate((y_train, y_test), axis=0)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
 X_train = torch.tensor(X_train, dtype=torch.long)
 y_train = torch.tensor(y_train, dtype=torch.float32)
@@ -28,27 +34,86 @@ y_test = torch.tensor(y_test, dtype=torch.float32)
 
 train_dataset = TensorDataset(X_train, y_train)
 test_dataset = TensorDataset(X_test, y_test)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
 
 class Classifier(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers=1):
-        super(Classifier, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm = FaultyLSTM(embed_dim, hidden_dim, num_layers)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
+    """
+    The RNN model that will be used to perform Sentiment analysis.
+    """
 
-    def forward(self, x, compute_grad=False, inject_faults=False):
-        x = self.embedding(x)
-        lstm_out = self.lstm(x, compute_grad=compute_grad, inject_faults=inject_faults)
-        out = self.fc(lstm_out)
-        return self.sigmoid(out)
+    def __init__(self, vocab_size, output_size, embedding_dim, hidden_dim):
+        """
+        Initialize the model by setting up the layers.
+        """
+        super().__init__()
+
+        self.output_size = output_size
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        
+        # embedding and LSTM layers
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = FaultyLSTM(embedding_dim, hidden_dim)
+        
+        # dropout layer
+        self.dropout = nn.Dropout(0.3)
+        
+        # linear and sigmoid layers
+        self.fc = nn.Linear(hidden_dim, output_size)
+        self.sig = nn.Sigmoid()
+        
+
+    def forward(self, x, hidden, compute_grad=False, inject_faults=False):
+        """
+        Perform a forward pass of our model on some input and hidden state.
+        """
+        batch_size = x.size(0)
+
+        # embeddings and lstm_out
+        embeds = self.embedding(x)
+        lstm_out, hidden = self.lstm(
+            embeds,
+            hidden=hidden,
+            compute_grad=compute_grad,
+            inject_faults=inject_faults
+        )
+    
+        # stack up lstm outputs
+        lstm_out = lstm_out.contiguous().view(-1, self.hidden_dim)
+        
+        # dropout and fully-connected layer
+        out = self.dropout(lstm_out)
+        out = self.fc(out)
+        # sigmoid function
+        sig_out = self.sig(out)
+        
+        # reshape to be batch_size first
+        sig_out = sig_out.view(batch_size, -1)
+        sig_out = sig_out[:, -1] # get last batch of labels
+        
+        # return last sigmoid output and hidden state
+        return sig_out, hidden
+    
+    
+    def init_hidden(self, batch_size):
+        ''' Initializes hidden state '''
+        # Create two new tensors with sizes n_layers x batch_size x hidden_dim,
+        # initialized to zero, for hidden state and cell state of LSTM
+        weight = next(self.parameters()).data
+
+        hidden = (weight.new(batch_size, self.hidden_dim).zero_(),
+                    weight.new(batch_size, self.hidden_dim).zero_())
+        
+        return hidden
 
 embed_dim = 32
-hidden_dim = 50
+hidden_dim = 100
+output_size = 1
+n_layers = 1
 
-model = Classifier(top_words, embed_dim, hidden_dim)
+model = Classifier(top_words, output_size, embed_dim, hidden_dim)
+print(model)
 
 criterion = nn.BCELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -57,6 +122,8 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 def train_model(model, train_loader, epochs=3):
     model.train()
     for epoch in range(epochs):
+        h = model.init_hidden(batch_size)
+
         total_loss = 0
         total_correct = 0
         total_labels = 0
@@ -65,13 +132,15 @@ def train_model(model, train_loader, epochs=3):
                 tepoch.set_description(f"Epoch {epoch+1}")
 
                 optimizer.zero_grad()
-                outputs = model(data).squeeze()  # Remove extra dimension
-                loss = criterion(outputs, target)
-                predictions = (outputs > 0.5).float()
+                h = tuple([each.data for each in h])
+                output, h = model(data, h)
+                loss = criterion(output.squeeze(), target)
+                predictions = (output.squeeze() > 0.5).float()
                 correct = (predictions == target).sum().item()
                 accuracy = correct / batch_size
 
                 loss.backward()  # need to include backprop
+                nn.utils.clip_grad_norm_(model.parameters(), 5)
                 optimizer.step()
 
                 total_loss += loss.item()
@@ -89,30 +158,29 @@ else:
     train_model(model, train_loader, epochs=3)
     torch.save(model.state_dict(), "saved_model.pth")
 
-def evaluate_model(model, test_loader, num_batches=400, compute_grad=False):
+def evaluate_model(model, test_loader, num_batches=400, compute_grad=False, inject_faults=False):
     model.eval()
-    total_clean_loss = 0
-    total_faulty_loss = 0
+    h = model.init_hidden(batch_size)
+    total_loss = 0
+    total_accuracy = 0
     with torch.no_grad():
         batch = 0
         for inputs, labels in test_loader:
-            outputs_clean = model(inputs, compute_grad=compute_grad).squeeze()
-            total_clean_loss += criterion(outputs_clean, labels)
-            print(f"Average clean loss for batch {batch+1}: {total_clean_loss / (batch+1)}")
-            if not compute_grad:
-                outputs_faulty = model(inputs, inject_faults=True).squeeze()
-                total_faulty_loss += criterion(outputs_faulty, labels)
-                print(f"Average faulty loss for batch {batch+1}: {total_faulty_loss / (batch+1)}")
+            output, h = model(inputs, hidden=h, compute_grad=compute_grad, inject_faults=inject_faults)
+            total_loss += criterion(output.squeeze(), labels)
+            preds = (output.squeeze() > 0.5).float()
+            accuracy = (preds == labels).sum().item() / batch_size
+            total_accuracy += accuracy
+            print(f"Accuracy for batch {batch+1}: {accuracy * 100.:.2f}%")
             batch += 1
             if batch >= num_batches:
                 break
-        percent_increase = (total_faulty_loss - total_clean_loss) / total_clean_loss
-        print(f"Percent increase: {percent_increase * 100.}%")
+        print(f"Average accuracy: {total_accuracy / batch * 100.:.2f}%")
         
 
 '''
 Compute statistics
 '''
-evaluate_model(model, train_loader, compute_grad=True)
+# evaluate_model(model, train_loader, compute_grad=True)
 
-evaluate_model(model, test_loader)
+evaluate_model(model, test_loader, inject_faults=True)

@@ -9,45 +9,47 @@ import numpy as np
 np.random.seed(42)
 
 class FaultyLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
+    def __init__(self, input_size, hidden_size):
         super(FaultyLSTM, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        self.cells = nn.ModuleList([nn.LSTMCell(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)])
+        self.hidden_size = hidden_size    
 
-        self.error_rate = 0.0000001
+        self.cell = nn.LSTMCell(input_size, hidden_size)
+
+        self.error_rate = 0.001
         self.k = 3
         self.mean_grad = {}
         self.var_grad = {}
         self.num_updates = {}
 
-    def forward(self, x, compute_grad=False, inject_faults=False):
+    def forward(self, x, hidden=None, compute_grad=False, inject_faults=False):
         batch_size, seq_len, _ = x.shape
 
-        h_t = [torch.zeros(batch_size, self.hidden_size) for _ in range(self.num_layers)]
-        c_t = [torch.zeros(batch_size, self.hidden_size) for _ in range(self.num_layers)]
+        if hidden is None:
+            h_t = torch.zeros(batch_size, self.hidden_size)
+            c_t = torch.zeros(batch_size, self.hidden_size)
+        else:
+            h_t, c_t = hidden
 
+        outputs = []
         for t in range(seq_len):
             x_t = x[:, t, :]    # input at timestep t
-            for i, layer in enumerate(self.cells):
-                h_t[i], c_t[i] = layer(x_t, (h_t[i], c_t[i]))
-                if not self.training:   # inject only during inference
-                    if not compute_grad and inject_faults:   # compute gradient over clean data only
-                        h_t[i] = self.bit_flip_fault_inj(h_t[i])
-                        c_t[i] = self.bit_flip_fault_inj(c_t[i])
-                    
-                    if compute_grad:
-                        self.update_running_statistics(h_t[i], f"h_{t}_{i}")
-                        self.update_running_statistics(c_t[i], f"c_{t}_{i}")
-        
-                    if not compute_grad and self.mean_grad:   # only threshold if gradients are already calculated
-                        h_t[i] = self.threshold_gradients(h_t[i], f"h_{t}_{i}")
-                        c_t[i] = self.threshold_gradients(c_t[i], f"c_{t}_{i}")
+            h_t, c_t = self.cell(x_t, (h_t, c_t))
+            if not self.training:   # inject only during inference
+                if not compute_grad and inject_faults:   # compute gradient over clean data only
+                    h_t = self.bit_flip_fault_inj(h_t)
+                    c_t = self.bit_flip_fault_inj(c_t)
                 
-                x_t = h_t[i]
-        
-        return h_t[-1]
+                if compute_grad:
+                    self.update_running_statistics(h_t, f"h_{t}")
+                    self.update_running_statistics(c_t, f"c_{t}")
+    
+                if not compute_grad and self.mean_grad:   # only threshold if gradients are already calculated
+                    h_t = self.threshold_gradients(h_t, f"h_{t}")
+                    c_t = self.threshold_gradients(c_t, f"c_{t}")
+            outputs.append(h_t.unsqueeze(0))
+        outputs = torch.cat(outputs, dim=0)
+        outputs = outputs.transpose(0, 1).contiguous()
+        return outputs, (h_t, c_t)
     
     def bit_flip_fault_inj(self, output):
         # Flatten tensor for easier manipulation
